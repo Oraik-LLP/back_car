@@ -274,12 +274,12 @@ app.post('/api/diagnose/symptoms', diagnosisGate, async (req, res) => {
 app.post('/api/diagnose/photos', diagnosisGate, async (req, res) => {
   try {
     await ensureDiagnosticQuotaAllowed(req);
-    const { vehicle, images = [], description } = req.body ?? {};
+    const { vehicle, images = [], description, obd_context } = req.body ?? {};
     const contents = [
       {
         role: 'user',
         parts: [
-          { text: buildPhotoPrompt({ vehicle, description }) },
+          { text: buildPhotoPrompt({ vehicle, description, obdContext: obd_context }) },
           ...images
             .filter((image) => image?.data && image?.mime_type)
             .slice(0, 8)
@@ -331,6 +331,40 @@ app.post('/api/diagnose/invoice-audit', diagnosisGate, async (req, res) => {
       responseMimeType: 'application/json',
     });
     const normalized = normalizeInvoiceAuditResponse(text, 'gemini');
+    res.json(normalized);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.post('/api/diagnose/obd-pro', diagnosisGate, async (req, res) => {
+  try {
+    const {
+      vehicle,
+      mode = 'idle',
+      is_partial = false,
+      completion_reason = 'completed',
+      target_duration_seconds = 0,
+      captured_duration_seconds = 0,
+      static_snapshot = {},
+      processed_scan = {},
+    } = req.body ?? {};
+    const prompt = buildObdProPrompt({
+      vehicle,
+      mode,
+      isPartial: is_partial,
+      completionReason: completion_reason,
+      targetDurationSeconds: target_duration_seconds,
+      capturedDurationSeconds: captured_duration_seconds,
+      staticSnapshot: static_snapshot,
+      processedScan: processed_scan,
+    });
+    const text = await generateText({
+      model: diagnosisModel,
+      prompt,
+      responseMimeType: 'application/json',
+    });
+    const normalized = normalizeDiagnosisResponse(text, 'gemini');
     res.json(normalized);
   } catch (error) {
     sendError(res, error);
@@ -400,8 +434,13 @@ app.post('/api/conversations/respond', liveGate, async (req, res) => {
 app.post('/api/live/text', liveGate, async (req, res) => {
   try {
     await ensureDiagnosticQuotaAllowed(req);
-    const { vehicle, history = [], message = '' } = req.body ?? {};
-    const prompt = buildLiveTextPrompt({ vehicle, history, message });
+    const { vehicle, history = [], message = '', obd_context } = req.body ?? {};
+    const prompt = buildLiveTextPrompt({
+      vehicle,
+      history,
+      message,
+      obdContext: obd_context,
+    });
     const text = await generateText({ model: liveHttpModel, prompt });
     await consumeDiagnosticQuotaForRequest(req);
     res.json({
@@ -418,10 +457,15 @@ app.post('/api/live/text', liveGate, async (req, res) => {
 app.post('/api/live/frame', liveGate, async (req, res) => {
   try {
     await ensureDiagnosticQuotaAllowed(req);
-    const { vehicle, history = [], message = '', image } = req.body ?? {};
+    const { vehicle, history = [], message = '', image, obd_context } = req.body ?? {};
     const parts = [
       {
-        text: buildLiveFramePrompt({ vehicle, history, message }),
+        text: buildLiveFramePrompt({
+          vehicle,
+          history,
+          message,
+          obdContext: obd_context,
+        }),
       },
     ];
     if (image?.data && image?.mime_type) {
@@ -454,7 +498,7 @@ app.post('/api/live/frame', liveGate, async (req, res) => {
 app.post('/api/live/voice', liveGate, async (req, res) => {
   try {
     await ensureDiagnosticQuotaAllowed(req);
-    const { vehicle, history = [], audio, image } = req.body ?? {};
+    const { vehicle, history = [], audio, image, obd_context } = req.body ?? {};
 
     const systemPrompt = `You are FixEase Live, a friendly expert automotive diagnostic assistant having a real-time voice conversation.
 
@@ -462,6 +506,8 @@ VEHICLE: ${vehicle?.display_name || 'Unknown'} (${vehicle?.fuel_label || 'Unknow
 
 CONVERSATION SO FAR:
 ${history.map((item) => `${item.role?.toUpperCase?.() || 'USER'}: ${item.text || ''}`).join('\n')}
+
+${buildObdContextAppendix(obd_context)}
 
 Respond naturally in 2-4 sentences. Be specific and practical. If the user sent a photo, analyze it carefully. Ask follow-up questions when needed.`;
 
@@ -677,7 +723,7 @@ DIAGNOSTIC FOCUS:
 - Keep the mechanic_script authoritative and workshop-grade. Reference likely DTC families, scan-tool checks, manufacturer-spec comparisons, backlash/play, fluid condition, wear limits in mm, and electrical ranges when appropriate.`;
 }
 
-function buildPhotoPrompt({ vehicle, description }) {
+function buildPhotoPrompt({ vehicle, description, obdContext }) {
   return `${buildDiagnosticSystemPrompt({
     vehicle,
     mode: 'photo',
@@ -697,6 +743,8 @@ function buildPhotoPrompt({ vehicle, description }) {
 
 USER DESCRIPTION: ${description || 'None'}
 
+${buildObdContextAppendix(obdContext)}
+
 VISUAL INSPECTION CHECKLIST:
 - visible damage
 - fluid leaks
@@ -710,6 +758,53 @@ DIAGNOSTIC FOCUS:
 - Base findings only on what is visible plus the user description.
 - State uncertainty honestly if the image quality, angle, or coverage is limited.
 - Keep the mechanic_script technical and inspection-oriented, with likely measurements, allowable ranges, and exact next checks where appropriate.`;
+}
+
+function buildObdProPrompt({
+  vehicle,
+  mode,
+  isPartial,
+  completionReason,
+  targetDurationSeconds,
+  capturedDurationSeconds,
+  staticSnapshot,
+  processedScan,
+}) {
+  return `${buildDiagnosticSystemPrompt({
+    vehicle,
+    mode: `obd_${mode}`,
+    subjectLabel: 'processed OBD2 telemetry and static ECU data',
+    schemaJson: `{
+  "summary": "One short empathy sentence first, then 1-2 factual technical sentences.",
+  "health_score": 0,
+  "confidence": 0.0,
+  "possible_causes": ["cause1"],
+  "recommendations": ["action1"],
+  "sub_scores": {"Combustion Stability": 0, "Air/Fuel Balance": 0, "Load Response": 0, "Electrical Health": 0, "Thermal Health": 0},
+  "urgency_note": "string or null",
+  "mechanic_script": "Dense mechanic-facing handoff with likely root-cause branches, expected live-data relationships, and next verification checks.",
+  "suggested_question": "string or null"
+}`,
+  })}
+
+SCAN MODE: ${mode}
+SCAN COMPLETENESS: ${isPartial ? 'Partial' : 'Full'}
+COMPLETION REASON: ${completionReason}
+TARGET DURATION SECONDS: ${targetDurationSeconds}
+CAPTURED DURATION SECONDS: ${capturedDurationSeconds}
+
+STATIC SNAPSHOT JSON:
+${JSON.stringify(staticSnapshot, null, 2)}
+
+PROCESSED SCAN JSON:
+${JSON.stringify(processedScan, null, 2)}
+
+OBD ANALYSIS RULES:
+- Base conclusions on the processed telemetry plus the static snapshot only.
+- Treat partial scans as lower confidence and say so clearly when relevant.
+- Infer likely mechanical health, fueling balance, thermal behavior, and load behavior from the recorded relationships.
+- If no severe defect is evident, say what still appears healthy.
+- Keep the mechanic_script workshop-grade and tied to likely live-data verification steps.`;
 }
 
 function buildInvoiceAuditPrompt({ vehicle, purpose }) {
@@ -897,7 +992,7 @@ NEW TURN:
 Respond in 2-6 sentences. Keep it helpful and conversational.`;
 }
 
-function buildLiveTextPrompt({ vehicle, history, message }) {
+function buildLiveTextPrompt({ vehicle, history, message, obdContext }) {
   return `You are FixEase Live, a real-time automotive diagnostic assistant.
 
 VEHICLE: ${vehicle?.display_name || 'Unknown'} (${vehicle?.fuel_label || 'Unknown fuel'}, ${vehicle?.mileage_km || 0} km)
@@ -905,12 +1000,14 @@ VEHICLE: ${vehicle?.display_name || 'Unknown'} (${vehicle?.fuel_label || 'Unknow
 CONVERSATION SO FAR:
 ${history.map((item) => `${item.role?.toUpperCase?.() || 'USER'}: ${item.text || ''}`).join('\n')}
 
+${buildObdContextAppendix(obdContext)}
+
 USER: ${message}
 
 Respond in 2-4 sentences. Be specific, practical, and ask for clarification if needed.`;
 }
 
-function buildLiveFramePrompt({ vehicle, history, message }) {
+function buildLiveFramePrompt({ vehicle, history, message, obdContext }) {
   return `You are FixEase Live, a real-time automotive diagnostic assistant reviewing a fresh camera frame.
 
 VEHICLE: ${vehicle?.display_name || 'Unknown'} (${vehicle?.fuel_label || 'Unknown fuel'}, ${vehicle?.mileage_km || 0} km)
@@ -918,9 +1015,21 @@ VEHICLE: ${vehicle?.display_name || 'Unknown'} (${vehicle?.fuel_label || 'Unknow
 CONVERSATION SO FAR:
 ${history.map((item) => `${item.role?.toUpperCase?.() || 'USER'}: ${item.text || ''}`).join('\n')}
 
+${buildObdContextAppendix(obdContext)}
+
 The user captured a frame and said: "${message}"
 
 Analyze the image and respond in 2-4 sentences. Name likely issues clearly. If needed, ask for another angle or a closer shot.`;
+}
+
+function buildObdContextAppendix(obdContext) {
+  if (!obdContext || typeof obdContext !== 'object' || Object.keys(obdContext).length === 0) {
+    return 'OBD CONTEXT: None';
+  }
+  return `LATEST OBD PRO CONTEXT:
+${JSON.stringify(obdContext, null, 2)}
+
+Use this only as supplemental context. Do not claim certainty beyond what the OBD data supports.`;
 }
 
 function resolveDeviceId(req) {
