@@ -15,9 +15,10 @@ const app = express();
 const port = Number(process.env.PORT || 8787);
 const diagnosisModel =
   process.env.GEMINI_DIAGNOSIS_MODEL || 'gemini-flash-latest';
-const liveHttpModel = 'gemini-flash-lite-latest'; // Must be REST compatible
+const liveHttpModel = 
+  process.env.GEMINI_LIVE_HTTP_MODEL || 'gemini-flash-lite-latest';
 const liveModel =
-  process.env.GEMINI_LIVE_MODEL || 'gemini-3.1-flash-live-preview';
+  process.env.GEMINI_LIVE_MODEL || 'gemini-flash-lite-latest';
 const maxJsonMb = Number(process.env.MAX_JSON_MB || 30);
 const maxJsonBytes = maxJsonMb * 1024 * 1024;
 const requestQueueTimeoutMs = Number(process.env.REQUEST_QUEUE_TIMEOUT_MS || 12000);
