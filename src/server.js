@@ -3,6 +3,8 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
+import { createPurchaseVerifier } from './purchase_verification.js';
+import { validateVehiclePhotos, vehicleRecognitionPrompt, normalizeVehicleRecognition } from './vehicle_recognition.js';
 import { GoogleGenAI } from '@google/genai';
 import {
   consumeDiagnosticQuota,
@@ -26,6 +28,8 @@ const largeRequestBytes = Number(process.env.LARGE_REQUEST_BYTES || 8 * 1024 * 1
 const upstreamTimeoutMs = Number(process.env.GEMINI_TIMEOUT_MS || 65000);
 const runningInProduction = process.env.NODE_ENV === 'production';
 const aiClient = createAiClient();
+const verifyRequestPlan = createPurchaseVerifier();
+const recognitionRequests = new Map();
 
 app.use(cors());
 app.use((req, res, next) => {
@@ -44,10 +48,16 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: `${maxJsonMb}mb` }));
 
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   req.requestId = Math.random().toString(36).slice(2, 10);
   req.requestStartedAt = Date.now();
-  const plan = resolveRequestPlan(req);
+  let plan;
+  try {
+    plan = await verifyRequestPlan(req);
+  } catch (error) {
+    sendError(res, error);
+    return;
+  }
   req.requestPlan = plan;
   res.on('finish', () => {
     const durationMs = Date.now() - req.requestStartedAt;
@@ -98,13 +108,6 @@ function createAiClient() {
     throw error;
   }
   return new GoogleGenAI({ apiKey });
-}
-
-function resolveRequestPlan(req) {
-  const rawPlan = String(req.headers['x-fixease-plan'] || 'free').toLowerCase();
-  return rawPlan === 'pro' || rawPlan === 'emergencypass' || rawPlan === 'emergency_pass'
-    ? 'pro'
-    : 'free';
 }
 
 function isLargeRequest(req) {
@@ -162,7 +165,7 @@ function createRequestGate({
 
   return async function gate(req, _res, next) {
     const ticket = {
-      plan: req.requestPlan || resolveRequestPlan(req),
+      plan: req.requestPlan || 'free',
       isLarge: isLargeRequest(req),
       resolve: null,
       timeout: null,
@@ -212,6 +215,9 @@ function createBusyError(errorCode) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
+    release: '1.1.0-v17',
+    purchase_verification: 'revenuecat-server-v1',
+    vehicle_recognition: 1,
     diagnosis_model: diagnosisModel,
     live_model: liveModel,
   });
@@ -267,6 +273,37 @@ app.post('/api/diagnose/symptoms', diagnosisGate, async (req, res) => {
     const normalized = normalizeDiagnosisResponse(text, 'gemini');
     await consumeDiagnosticQuotaForRequest(req);
     res.json(normalized);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.post('/api/vehicles/recognize', diagnosisGate, async (req, res) => {
+  try {
+    const device = resolveDeviceId(req);
+    if (!device || device.length > 200) {
+      res.status(400).json({message: 'A device identifier is required.', error_code: 'missing_device_id', retryable: false});
+      return;
+    }
+    const images = req.body?.images;
+    const photoParts = validateVehiclePhotos(images);
+    const now = Date.now();
+    const previous = recognitionRequests.get(device);
+    const window = previous && now - previous.startedAt < 10 * 60 * 1000
+      ? previous : {startedAt: now, count: 0};
+    if (window.count >= 6) {
+      res.status(429).json({message: 'Please wait before trying more vehicle photos, or type details instead.', error_code: 'recognition_rate_limited', retryable: true});
+      return;
+    }
+    window.count++;
+    if (recognitionRequests.size >= 1000 && !recognitionRequests.has(device)) {
+      recognitionRequests.delete(recognitionRequests.keys().next().value);
+    }
+    recognitionRequests.set(device, window);
+    const raw = await generateContent({model: diagnosisModel, responseMimeType: 'application/json',
+      maxOutputTokens: 1600,
+      contents: [{role: 'user', parts: [{text: vehicleRecognitionPrompt}, ...photoParts]}]});
+    res.json(normalizeVehicleRecognition(raw, photoParts.length));
   } catch (error) {
     sendError(res, error);
   }
@@ -572,6 +609,7 @@ async function generateContent({ model, contents, responseMimeType, maxOutputTok
         model,
         contents,
         config: {
+          systemInstruction: 'Respect the supplied road-vehicle category and powertrain. Unknown year, fuel, mileage, service history or VIN is missing information, never a default. Do not assume motorcycle, scooter, EV or heavy-truck components are passenger-car components. Do not claim OBD compatibility from a make/model alone. Distinguish possibilities from measured findings; unmeasured systems are not verified healthy. Follow the specific task and output schema in the request.',
           ...(responseMimeType ? { responseMimeType } : {}),
           ...(maxOutputTokens ? { maxOutputTokens } : {}),
         },
@@ -1174,6 +1212,9 @@ wss.on('connection', async (ws, req) => {
   console.log(`[${new Date().toISOString()}] WS /api/live/stream connected`);
 
   try {
+    req.requestPlan = await verifyRequestPlan(req);
+    await ensureDiagnosticQuotaAllowed(req);
+    await consumeDiagnosticQuotaForRequest(req);
     const session = await aiClient.live.connect({
       model: liveModel,
       config: {
